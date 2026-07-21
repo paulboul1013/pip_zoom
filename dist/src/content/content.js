@@ -123,6 +123,12 @@ function getOutputSize({ sw, sh, maxLongEdge = 1280 }) {
   };
 }
 
+function hasVideoDimensionsChanged(previous, videoWidth, videoHeight) {
+  return !previous
+    || previous.width !== videoWidth
+    || previous.height !== videoHeight;
+}
+
 function roundAndClamp(value, min, max) {
   return Math.min(max, Math.max(min, Math.round(value * 1_000) / 1_000));
 }
@@ -170,6 +176,7 @@ class PiPZoomController {
     this.video = video;
     this.state = new PiPSessionState();
     this.objectFit = getComputedStyle(video).objectFit || 'fill';
+    this.videoSize = { width: video.videoWidth, height: video.videoHeight };
     this.contentRect = this.readContentRect();
     this.selection = centeredSelection(this.contentRect);
     this.frameRequestId = null;
@@ -177,8 +184,9 @@ class PiPZoomController {
     this.proxyVideo = null;
     this.canvas = null;
     this.resizeObserver = new ResizeObserver(() => this.reposition());
-    this.resizeObserver.observe(video);
     this.boundReposition = () => this.reposition();
+    this.boundVideoResize = () => this.handleVideoResize();
+    this.boundVideoReplacement = () => this.handleVideoReplacement();
     this.boundDestroy = () => this.destroy();
     this.boundKeydown = (event) => {
       if (event.key === 'Escape') this.destroy();
@@ -189,7 +197,24 @@ class PiPZoomController {
     window.visualViewport?.addEventListener('scroll', this.boundReposition);
     document.addEventListener('fullscreenchange', this.boundReposition);
     window.addEventListener('pagehide', this.boundDestroy, { once: true });
+    this.attachVideoObservers();
+    this.videoMutationObserver = new MutationObserver(this.boundVideoReplacement);
+    this.videoMutationObserver.observe(document.documentElement, { childList: true, subtree: true });
     this.mountOverlay();
+  }
+
+  attachVideoObservers() {
+    this.resizeObserver.observe(this.video);
+    this.video.addEventListener('resize', this.boundVideoResize);
+    this.video.addEventListener('loadedmetadata', this.boundVideoResize);
+    this.video.addEventListener('loadeddata', this.boundVideoResize);
+  }
+
+  detachVideoObservers() {
+    this.resizeObserver.unobserve(this.video);
+    this.video.removeEventListener('resize', this.boundVideoResize);
+    this.video.removeEventListener('loadedmetadata', this.boundVideoResize);
+    this.video.removeEventListener('loadeddata', this.boundVideoResize);
   }
 
   readContentRect() {
@@ -263,12 +288,47 @@ class PiPZoomController {
   }
 
   reposition() {
+    if (this.video.videoWidth <= 0 || this.video.videoHeight <= 0) return;
     try {
       this.contentRect = this.readContentRect();
       this.selection = clampRect(this.selection, this.contentRect);
       this.render();
     } catch {
       this.destroy();
+    }
+  }
+
+  handleVideoResize() {
+    if (this.video.videoWidth <= 0 || this.video.videoHeight <= 0) return;
+
+    const changed = hasVideoDimensionsChanged(
+      this.videoSize,
+      this.video.videoWidth,
+      this.video.videoHeight,
+    );
+    this.videoSize = { width: this.video.videoWidth, height: this.video.videoHeight };
+    this.reposition();
+    if (changed && this.state.isPiPActive) this.refreshPipeline();
+  }
+
+  handleVideoReplacement() {
+    if (this.video.isConnected) return;
+
+    const replacement = [...document.querySelectorAll('video')].find(
+      (candidate) => candidate !== this.proxyVideo && isEligibleVideo(candidate),
+    );
+    if (!replacement) return;
+
+    if (this.state.isPiPActive) this.cancelFrameLoop();
+    this.detachVideoObservers();
+    this.video = replacement;
+    this.objectFit = getComputedStyle(replacement).objectFit || 'fill';
+    this.videoSize = { width: replacement.videoWidth, height: replacement.videoHeight };
+    this.attachVideoObservers();
+    this.reposition();
+    if (this.state.isPiPActive) {
+      this.refreshPipeline();
+      this.scheduleFrame();
     }
   }
 
@@ -323,6 +383,7 @@ class PiPZoomController {
       this.state.activatePiP();
       this.lockSelection();
       this.setStatus('PiP 已啟動');
+      this.pipelineVideoSize = { ...this.videoSize };
       this.scheduleFrame();
     } catch (error) {
       this.stopPipeline();
@@ -351,33 +412,76 @@ class PiPZoomController {
     this.context.drawImage(this.video, this.source.sx, this.source.sy, this.source.sw, this.source.sh, 0, 0, this.canvas.width, this.canvas.height);
   }
 
+  refreshPipeline() {
+    if (!this.canvas || !this.proxyVideo || !this.state.isPiPActive) return;
+
+    try {
+      const source = selectionToSourceRect({
+        box: rectToPlainObject(this.video.getBoundingClientRect()),
+        selection: this.selection,
+        videoWidth: this.video.videoWidth,
+        videoHeight: this.video.videoHeight,
+        objectFit: this.objectFit,
+      });
+      const output = getOutputSize(source);
+      if (this.canvas.width !== output.width || this.canvas.height !== output.height) {
+        this.canvas.width = output.width;
+        this.canvas.height = output.height;
+        this.context = this.canvas.getContext('2d', { alpha: false });
+      }
+      this.source = source;
+      this.pipelineVideoSize = { width: this.video.videoWidth, height: this.video.videoHeight };
+      this.drawFrame();
+    } catch (error) {
+      this.setStatus('影片畫質切換中，正在重新同步 PiP。');
+      console.warn('PiP Zoom could not refresh the video crop.', error);
+    }
+  }
+
   scheduleFrame() {
     if (!this.canvas || !this.proxyVideo) return;
     if (this.video.requestVideoFrameCallback) {
       this.frameRequestId = this.video.requestVideoFrameCallback(() => {
-        this.drawFrame();
+        this.renderScheduledFrame();
         this.scheduleFrame();
       });
     } else {
       this.frameRequestId = requestAnimationFrame(() => {
-        this.drawFrame();
+        this.renderScheduledFrame();
         this.scheduleFrame();
       });
     }
   }
 
-  stopPipeline() {
-    if (this.frameRequestId !== null) {
-      if (this.video.cancelVideoFrameCallback) this.video.cancelVideoFrameCallback(this.frameRequestId);
-      else cancelAnimationFrame(this.frameRequestId);
+  renderScheduledFrame() {
+    try {
+      if (hasVideoDimensionsChanged(this.pipelineVideoSize, this.video.videoWidth, this.video.videoHeight)) {
+        this.refreshPipeline();
+      }
+      this.drawFrame();
+    } catch (error) {
+      // A quality switch can race a frame callback. Keep the loop alive and
+      // let the next metadata/resize event provide stable dimensions.
+      console.warn('PiP Zoom skipped a frame during video quality change.', error);
     }
-    this.frameRequestId = null;
+  }
+
+  stopPipeline() {
+    this.cancelFrameLoop();
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.proxyVideo?.remove();
     this.proxyVideo = null;
     this.canvas = null;
     this.context = null;
+  }
+
+  cancelFrameLoop() {
+    if (this.frameRequestId !== null) {
+      if (this.video.cancelVideoFrameCallback) this.video.cancelVideoFrameCallback(this.frameRequestId);
+      else cancelAnimationFrame(this.frameRequestId);
+    }
+    this.frameRequestId = null;
   }
 
   lockSelection() {
@@ -392,6 +496,8 @@ class PiPZoomController {
   destroy() {
     this.state?.cancel();
     this.stopPipeline();
+    this.detachVideoObservers();
+    this.videoMutationObserver?.disconnect();
     this.resizeObserver?.disconnect();
     window.removeEventListener('scroll', this.boundReposition, true);
     window.removeEventListener('resize', this.boundReposition);
@@ -456,6 +562,15 @@ function showMessage(message) {
   console.warn(`PiP Zoom: ${message}`);
 }
 
+function isEligibleVideo(video) {
+  const rect = video.getBoundingClientRect();
+  return video.readyState >= HTMLMediaElement.HAVE_METADATA
+    && video.videoWidth > 0
+    && video.videoHeight > 0
+    && rect.width > 0
+    && rect.height > 0;
+}
+
 const existingController = globalThis[CONTROLLER_KEY];
 if (existingController?.isPiPActive()) {
   // Keep the proxy stream alive until leavepictureinpicture fires; destroying it
@@ -464,14 +579,7 @@ if (existingController?.isPiPActive()) {
 } else {
   existingController?.destroy();
 
-  const candidates = [...document.querySelectorAll('video')].filter((video) => {
-    const rect = video.getBoundingClientRect();
-    return video.readyState >= HTMLMediaElement.HAVE_METADATA
-      && video.videoWidth > 0
-      && video.videoHeight > 0
-      && rect.width > 0
-      && rect.height > 0;
-  });
+  const candidates = [...document.querySelectorAll('video')].filter(isEligibleVideo);
 
   const target = candidates.find((video) => !video.paused) ?? candidates[0];
   if (!target) {

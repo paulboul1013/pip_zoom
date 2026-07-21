@@ -122,6 +122,12 @@ export function getOutputSize({ sw, sh, maxLongEdge = 1280 }) {
   };
 }
 
+export function hasVideoDimensionsChanged(previous, videoWidth, videoHeight) {
+  return !previous
+    || previous.width !== videoWidth
+    || previous.height !== videoHeight;
+}
+
 function roundAndClamp(value, min, max) {
   return Math.min(max, Math.max(min, Math.round(value * 1_000) / 1_000));
 }
