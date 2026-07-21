@@ -166,6 +166,22 @@ class PiPSessionState {
   }
 }
 
+function chooseHighestQualityOption(labels) {
+  return labels
+    .map((label, index) => ({ index, score: qualityScore(label) }))
+    .filter(({ score }) => score >= 0)
+    .sort((first, second) => second.score - first.score)[0]?.index ?? -1;
+}
+
+function qualityScore(label) {
+  const text = String(label).toLowerCase();
+  if (text.includes('source')) return Number.MAX_SAFE_INTEGER;
+
+  const resolution = Number(text.match(/(\d{3,4})p/)?.[1] ?? 0);
+  const frameRate = Number(text.match(/(\d{2,3})\s*fps/)?.[1] ?? 0);
+  return resolution > 0 ? resolution * 1_000 + frameRate : -1;
+}
+
 
 const CONTROLLER_KEY = '__pipZoomController__';
 const MIN_SELECTION_SIZE = 48;
@@ -183,6 +199,8 @@ class PiPZoomController {
     this.stream = null;
     this.proxyVideo = null;
     this.canvas = null;
+    this.twitchQualityTimer = null;
+    this.twitchQualityBusy = false;
     this.resizeObserver = new ResizeObserver(() => this.reposition());
     this.boundReposition = () => this.reposition();
     this.boundVideoResize = () => this.handleVideoResize();
@@ -384,6 +402,7 @@ class PiPZoomController {
       this.lockSelection();
       this.setStatus('PiP 已啟動');
       this.pipelineVideoSize = { ...this.videoSize };
+      this.startTwitchQualityKeeper();
       this.scheduleFrame();
     } catch (error) {
       this.stopPipeline();
@@ -405,6 +424,45 @@ class PiPZoomController {
       await document.exitPictureInPicture();
     } catch (error) {
       console.warn('PiP Zoom could not close Picture-in-Picture.', error);
+    }
+  }
+
+  startTwitchQualityKeeper() {
+    if (!isTwitchPage() || this.twitchQualityTimer) return;
+
+    this.ensureTwitchHighestQuality();
+    this.twitchQualityTimer = window.setInterval(
+      () => this.ensureTwitchHighestQuality(),
+      10_000,
+    );
+  }
+
+  async ensureTwitchHighestQuality() {
+    if (!this.state.isPiPActive || this.twitchQualityBusy) return;
+
+    const settingsButton = document.querySelector('[data-a-target="player-settings-button"]');
+    if (!settingsButton) return;
+
+    this.twitchQualityBusy = true;
+    try {
+      settingsButton.click();
+      const qualityMenu = await waitForElement(
+        '[data-a-target="player-settings-menu-item-quality"]',
+      );
+      if (!qualityMenu) return;
+      qualityMenu.click();
+
+      const options = await waitForElements(
+        '[data-a-target="player-settings-submenu-quality-option"]',
+      );
+      const optionIndex = chooseHighestQualityOption(
+        options.map((option) => option.textContent ?? ''),
+      );
+      if (optionIndex >= 0) options[optionIndex].click();
+    } catch (error) {
+      console.warn('PiP Zoom could not set Twitch quality.', error);
+    } finally {
+      this.twitchQualityBusy = false;
     }
   }
 
@@ -495,6 +553,8 @@ class PiPZoomController {
 
   destroy() {
     this.state?.cancel();
+    if (this.twitchQualityTimer) window.clearInterval(this.twitchQualityTimer);
+    this.twitchQualityTimer = null;
     this.stopPipeline();
     this.detachVideoObservers();
     this.videoMutationObserver?.disconnect();
@@ -560,6 +620,48 @@ function setRectStyle(element, rect) {
 
 function showMessage(message) {
   console.warn(`PiP Zoom: ${message}`);
+}
+
+function isTwitchPage() {
+  return location.hostname === 'twitch.tv' || location.hostname.endsWith('.twitch.tv');
+}
+
+function waitForElement(selector, timeout = 1_500) {
+  const existing = document.querySelector(selector);
+  if (existing) return Promise.resolve(existing);
+  return new Promise((resolve) => {
+    const observer = new MutationObserver(() => {
+      const element = document.querySelector(selector);
+      if (!element) return;
+      observer.disconnect();
+      window.clearTimeout(timer);
+      resolve(element);
+    });
+    const timer = window.setTimeout(() => {
+      observer.disconnect();
+      resolve(null);
+    }, timeout);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  });
+}
+
+function waitForElements(selector, timeout = 1_500) {
+  const existing = [...document.querySelectorAll(selector)];
+  if (existing.length > 0) return Promise.resolve(existing);
+  return new Promise((resolve) => {
+    const observer = new MutationObserver(() => {
+      const elements = [...document.querySelectorAll(selector)];
+      if (elements.length === 0) return;
+      observer.disconnect();
+      window.clearTimeout(timer);
+      resolve(elements);
+    });
+    const timer = window.setTimeout(() => {
+      observer.disconnect();
+      resolve([]);
+    }, timeout);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  });
 }
 
 function isEligibleVideo(video) {
