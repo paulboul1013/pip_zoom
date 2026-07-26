@@ -182,6 +182,34 @@ function qualityScore(label) {
   return resolution > 0 ? resolution * 1_000 + frameRate : -1;
 }
 
+function captureAudioTracks(video) {
+  const captureStream = video.captureStream ?? video.mozCaptureStream;
+  if (typeof captureStream !== 'function') {
+    return { stream: null, tracks: [] };
+  }
+
+  try {
+    const stream = captureStream.call(video);
+    const tracks = typeof stream?.getAudioTracks === 'function'
+      ? stream.getAudioTracks()
+      : [];
+    return { stream, tracks };
+  } catch {
+    return { stream: null, tracks: [] };
+  }
+}
+
+function muteSourceVideoForPiP(video) {
+  const state = { video, muted: video.muted };
+  video.muted = true;
+  return state;
+}
+
+function restoreSourceVideoAudio(state) {
+  if (!state?.video) return;
+  state.video.muted = state.muted;
+}
+
 
 const CONTROLLER_KEY = '__pipZoomController__';
 const MIN_SELECTION_SIZE = 48;
@@ -197,6 +225,10 @@ class PiPZoomController {
     this.selection = centeredSelection(this.contentRect);
     this.frameRequestId = null;
     this.stream = null;
+    this.videoStream = null;
+    this.audioSourceStream = null;
+    this.audioTracks = [];
+    this.sourceAudioState = null;
     this.proxyVideo = null;
     this.canvas = null;
     this.twitchQualityTimer = null;
@@ -337,7 +369,10 @@ class PiPZoomController {
     );
     if (!replacement) return;
 
-    if (this.state.isPiPActive) this.cancelFrameLoop();
+    if (this.state.isPiPActive) {
+      this.cancelFrameLoop();
+      this.detachAudioPipeline();
+    }
     this.detachVideoObservers();
     this.video = replacement;
     this.objectFit = getComputedStyle(replacement).objectFit || 'fill';
@@ -346,6 +381,7 @@ class PiPZoomController {
     this.reposition();
     if (this.state.isPiPActive) {
       this.refreshPipeline();
+      this.attachAudioPipeline();
       this.scheduleFrame();
     }
   }
@@ -385,9 +421,12 @@ class PiPZoomController {
       if (!this.context) throw new Error('無法建立影像輸出。');
       this.source = source;
       this.drawFrame();
-      this.stream = this.canvas.captureStream(OUTPUT_FPS);
+      this.videoStream = this.canvas.captureStream(OUTPUT_FPS);
+      this.stream = new MediaStream(this.videoStream.getVideoTracks());
+      this.attachAudioPipeline();
       this.proxyVideo = document.createElement('video');
-      this.proxyVideo.muted = true;
+      this.proxyVideo.muted = this.sourceAudioState?.muted ?? false;
+      this.proxyVideo.volume = this.video.volume;
       this.proxyVideo.playsInline = true;
       this.proxyVideo.srcObject = this.stream;
       this.proxyVideo.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;';
@@ -466,6 +505,30 @@ class PiPZoomController {
     }
   }
 
+  attachAudioPipeline() {
+    if (!this.stream) return;
+
+    const capture = captureAudioTracks(this.video);
+    this.audioSourceStream = capture.stream;
+    this.audioTracks = capture.tracks;
+    if (this.audioTracks.length === 0) return;
+
+    this.audioTracks.forEach((track) => this.stream.addTrack(track));
+    this.sourceAudioState = muteSourceVideoForPiP(this.video);
+  }
+
+  detachAudioPipeline() {
+    restoreSourceVideoAudio(this.sourceAudioState);
+    this.sourceAudioState = null;
+
+    if (this.stream) {
+      this.audioTracks.forEach((track) => this.stream.removeTrack(track));
+    }
+    this.audioSourceStream?.getTracks?.().forEach((track) => track.stop());
+    this.audioSourceStream = null;
+    this.audioTracks = [];
+  }
+
   drawFrame() {
     this.context.drawImage(this.video, this.source.sx, this.source.sy, this.source.sw, this.source.sh, 0, 0, this.canvas.width, this.canvas.height);
   }
@@ -526,8 +589,10 @@ class PiPZoomController {
 
   stopPipeline() {
     this.cancelFrameLoop();
+    this.detachAudioPipeline();
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
+    this.videoStream = null;
     this.proxyVideo?.remove();
     this.proxyVideo = null;
     this.canvas = null;
