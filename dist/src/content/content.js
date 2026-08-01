@@ -210,6 +210,25 @@ function restoreSourceVideoAudio(state) {
   state.video.muted = state.muted;
 }
 
+const ROTATION_STEP = 90;
+const FULL_TURN = 360;
+
+function normalizeRotation(rotation) {
+  const normalized = rotation % FULL_TURN;
+  return normalized < 0 ? normalized + FULL_TURN : normalized;
+}
+
+function nextRotation(rotation) {
+  return normalizeRotation(rotation + ROTATION_STEP);
+}
+
+function getRotatedOutputSize({ width, height, rotation }) {
+  const normalized = normalizeRotation(rotation);
+  return normalized === 90 || normalized === 270
+    ? { width: height, height: width }
+    : { width, height };
+}
+
 
 const CONTROLLER_KEY = '__pipZoomController__';
 const MIN_SELECTION_SIZE = 48;
@@ -229,6 +248,9 @@ class PiPZoomController {
     this.audioSourceStream = null;
     this.audioTracks = [];
     this.sourceAudioState = null;
+    this.rotation = 0;
+    this.outputSize = null;
+    this.rotationHideTimer = null;
     this.proxyVideo = null;
     this.canvas = null;
     this.twitchQualityTimer = null;
@@ -238,6 +260,7 @@ class PiPZoomController {
     this.boundVideoResize = () => this.handleVideoResize();
     this.boundVideoReplacement = () => this.handleVideoReplacement();
     this.boundDestroy = () => this.destroy();
+    this.boundPointerMove = (event) => this.handlePointerMove(event);
     this.boundKeydown = (event) => {
       if (event.key === 'Escape') this.destroy();
     };
@@ -246,6 +269,7 @@ class PiPZoomController {
     window.visualViewport?.addEventListener('resize', this.boundReposition);
     window.visualViewport?.addEventListener('scroll', this.boundReposition);
     document.addEventListener('fullscreenchange', this.boundReposition);
+    document.addEventListener('pointermove', this.boundPointerMove, true);
     window.addEventListener('pagehide', this.boundDestroy, { once: true });
     this.attachVideoObservers();
     this.videoMutationObserver = new MutationObserver(this.boundVideoReplacement);
@@ -287,8 +311,10 @@ class PiPZoomController {
       #stage { position: fixed; border: 2px solid #63b3ed; box-sizing: border-box; pointer-events: auto; cursor: crosshair; touch-action: none; }
       #selection { position: absolute; box-sizing: border-box; border: 2px solid #f8fafc; background: rgba(49, 130, 206, .22); box-shadow: 0 0 0 9999px rgba(0, 0, 0, .45); pointer-events: none; }
       #toolbar { position: fixed; display: flex; gap: 8px; padding: 8px; border-radius: 8px; background: #111827; box-shadow: 0 4px 12px rgba(0,0,0,.4); font: 13px system-ui, sans-serif; pointer-events: auto; }
+      #pip-controls { position: fixed; display: none; padding: 4px; border-radius: 7px; background: #111827; box-shadow: 0 4px 12px rgba(0,0,0,.4); pointer-events: auto; }
       button { border: 0; border-radius: 5px; padding: 6px 10px; color: #fff; background: #2563eb; cursor: pointer; font: inherit; }
-      button:last-child { background: #4b5563; }
+      #toolbar > button:last-of-type { background: #4b5563; }
+      #rotate-button { min-width: 34px; padding: 5px 8px; font-size: 18px; line-height: 1; }
       #status { max-width: 240px; color: #fff; align-self: center; }
     `;
     this.stage = document.createElement('div');
@@ -306,12 +332,28 @@ class PiPZoomController {
     this.cancelButton.textContent = '取消';
     this.status = document.createElement('span');
     this.status.id = 'status';
+    this.pipControls = document.createElement('div');
+    this.pipControls.id = 'pip-controls';
+    this.rotateButton = document.createElement('button');
+    this.rotateButton.id = 'rotate-button';
+    this.rotateButton.type = 'button';
+    this.rotateButton.textContent = '↻';
+    this.rotateButton.title = '旋轉 PiP 90°';
+    this.rotateButton.setAttribute('aria-label', '旋轉 PiP 90 度');
+    this.pipControls.append(this.rotateButton);
     this.toolbar.append(this.startButton, this.cancelButton, this.status);
-    this.shadow.append(style, this.stage, this.toolbar);
+    this.shadow.append(style, this.stage, this.toolbar, this.pipControls);
     document.documentElement.append(this.host);
     this.stage.addEventListener('pointerdown', (event) => this.beginSelection(event));
     this.startButton.addEventListener('click', () => this.startPiP());
     this.cancelButton.addEventListener('click', () => this.destroy());
+    this.rotateButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.rotatePiP();
+    });
+    this.pipControls.addEventListener('pointerenter', () => this.clearRotationHideTimer());
+    this.pipControls.addEventListener('pointerleave', () => this.scheduleRotationControlHide());
     document.addEventListener('keydown', this.boundKeydown);
     this.render();
   }
@@ -397,6 +439,7 @@ class PiPZoomController {
     });
     this.toolbar.style.left = `${Math.max(8, content.left)}px`;
     this.toolbar.style.top = `${Math.max(8, content.top - 48)}px`;
+    this.positionRotationControl();
   }
 
   async startPiP() {
@@ -414,9 +457,12 @@ class PiPZoomController {
         objectFit: this.objectFit,
       });
       const output = getOutputSize(source);
+      this.rotation = 0;
+      this.outputSize = output;
+      const canvasSize = getRotatedOutputSize({ ...output, rotation: this.rotation });
       this.canvas = document.createElement('canvas');
-      this.canvas.width = output.width;
-      this.canvas.height = output.height;
+      this.canvas.width = canvasSize.width;
+      this.canvas.height = canvasSize.height;
       this.context = this.canvas.getContext('2d', { alpha: false });
       if (!this.context) throw new Error('無法建立影像輸出。');
       this.source = source;
@@ -517,6 +563,14 @@ class PiPZoomController {
     this.sourceAudioState = muteSourceVideoForPiP(this.video);
   }
 
+  rotatePiP() {
+    if (!this.state.isPiPActive) return;
+    this.rotation = nextRotation(this.rotation);
+    this.refreshPipeline();
+    this.setStatus(`PiP 已旋轉 ${this.rotation}°`);
+    this.showRotationControl();
+  }
+
   detachAudioPipeline() {
     restoreSourceVideoAudio(this.sourceAudioState);
     this.sourceAudioState = null;
@@ -530,7 +584,34 @@ class PiPZoomController {
   }
 
   drawFrame() {
-    this.context.drawImage(this.video, this.source.sx, this.source.sy, this.source.sw, this.source.sh, 0, 0, this.canvas.width, this.canvas.height);
+    if (!this.outputSize) return;
+
+    this.context.save();
+    try {
+      if (this.rotation === 90) {
+        this.context.translate(this.canvas.width, 0);
+        this.context.rotate(Math.PI / 2);
+      } else if (this.rotation === 180) {
+        this.context.translate(this.canvas.width, this.canvas.height);
+        this.context.rotate(Math.PI);
+      } else if (this.rotation === 270) {
+        this.context.translate(0, this.canvas.height);
+        this.context.rotate(-Math.PI / 2);
+      }
+      this.context.drawImage(
+        this.video,
+        this.source.sx,
+        this.source.sy,
+        this.source.sw,
+        this.source.sh,
+        0,
+        0,
+        this.outputSize.width,
+        this.outputSize.height,
+      );
+    } finally {
+      this.context.restore();
+    }
   }
 
   refreshPipeline() {
@@ -545,12 +626,14 @@ class PiPZoomController {
         objectFit: this.objectFit,
       });
       const output = getOutputSize(source);
-      if (this.canvas.width !== output.width || this.canvas.height !== output.height) {
-        this.canvas.width = output.width;
-        this.canvas.height = output.height;
+      const canvasSize = getRotatedOutputSize({ ...output, rotation: this.rotation });
+      if (this.canvas.width !== canvasSize.width || this.canvas.height !== canvasSize.height) {
+        this.canvas.width = canvasSize.width;
+        this.canvas.height = canvasSize.height;
         this.context = this.canvas.getContext('2d', { alpha: false });
       }
       this.source = source;
+      this.outputSize = output;
       this.pipelineVideoSize = { width: this.video.videoWidth, height: this.video.videoHeight };
       this.drawFrame();
     } catch (error) {
@@ -593,6 +676,7 @@ class PiPZoomController {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.videoStream = null;
+    this.outputSize = null;
     this.proxyVideo?.remove();
     this.proxyVideo = null;
     this.canvas = null;
@@ -612,6 +696,52 @@ class PiPZoomController {
     this.toolbar.style.display = 'none';
   }
 
+  handlePointerMove(event) {
+    if (!this.state.isPiPActive) return;
+    const isOverSelectedRegion = pointInRect(event.clientX, event.clientY, this.selection);
+    if (isOverSelectedRegion) {
+      this.showRotationControl();
+    } else if (!this.pipControls.matches(':hover')) {
+      this.scheduleRotationControlHide();
+    }
+  }
+
+  positionRotationControl() {
+    if (!this.pipControls) return;
+    const left = Math.min(
+      Math.max(8, this.selection.left),
+      Math.max(8, window.innerWidth - 52),
+    );
+    const top = Math.min(
+      this.selection.top + this.selection.height + 8,
+      Math.max(8, window.innerHeight - 48),
+    );
+    this.pipControls.style.left = `${left}px`;
+    this.pipControls.style.top = `${top}px`;
+  }
+
+  showRotationControl() {
+    if (!this.state.isPiPActive) return;
+    this.clearRotationHideTimer();
+    this.positionRotationControl();
+    this.pipControls.style.display = 'block';
+  }
+
+  scheduleRotationControlHide() {
+    this.clearRotationHideTimer();
+    this.rotationHideTimer = window.setTimeout(() => {
+      this.pipControls.style.display = 'none';
+      this.rotationHideTimer = null;
+    }, 900);
+  }
+
+  clearRotationHideTimer() {
+    if (this.rotationHideTimer !== null) {
+      window.clearTimeout(this.rotationHideTimer);
+      this.rotationHideTimer = null;
+    }
+  }
+
   setStatus(message) {
     this.status.textContent = message;
   }
@@ -629,7 +759,9 @@ class PiPZoomController {
     window.visualViewport?.removeEventListener('resize', this.boundReposition);
     window.visualViewport?.removeEventListener('scroll', this.boundReposition);
     document.removeEventListener('fullscreenchange', this.boundReposition);
+    document.removeEventListener('pointermove', this.boundPointerMove, true);
     document.removeEventListener('keydown', this.boundKeydown);
+    this.clearRotationHideTimer();
     this.host?.remove();
     delete globalThis[CONTROLLER_KEY];
   }
@@ -655,6 +787,13 @@ function clampPoint(point, bounds) {
     x: Math.min(bounds.left + bounds.width, Math.max(bounds.left, point.x)),
     y: Math.min(bounds.top + bounds.height, Math.max(bounds.top, point.y)),
   };
+}
+
+function pointInRect(x, y, rect) {
+  return x >= rect.left
+    && x <= rect.left + rect.width
+    && y >= rect.top
+    && y <= rect.top + rect.height;
 }
 
 function normalizedRect(start, end, bounds) {
@@ -740,9 +879,9 @@ function isEligibleVideo(video) {
 
 const existingController = globalThis[CONTROLLER_KEY];
 if (existingController?.isPiPActive()) {
-  // Keep the proxy stream alive until leavepictureinpicture fires; destroying it
-  // first is what caused the native PiP window to turn black.
-  existingController.exitPiP();
+  // The native PiP window cannot host custom controls. Reuse the extension
+  // action as a simple way to rotate the active PiP output.
+  existingController.rotatePiP();
 } else {
   existingController?.destroy();
 
