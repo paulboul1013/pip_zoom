@@ -2,19 +2,16 @@
 
 [繁體中文](README.zh-TW.md)
 
-PiP Zoom is a browser extension that displays a user-selected region of a web video in Picture-in-Picture (PiP) mode.
-
-For example, you can watch only a livestream scoreboard or one part of a tutorial instead of the entire video.
-
-
+PiP Zoom shows a selected area of a web video in Picture-in-Picture (PiP) mode.
 
 ## Usage
 
 1. Open a webpage with a playing video.
 2. Click the PiP Zoom icon in the browser toolbar.
 3. Drag over the region you want to watch.
-4. Click **Start PiP** in the upper-left control bar.
-5. Close PiP to return to the normal webpage video.
+4. Click **Start PiP**.
+5. While PiP is active, click the PiP Zoom toolbar icon again to rotate the output by 90 degrees. Repeat to cycle through all four orientations.
+6. Close PiP to return to the webpage video.
 
 ## Loading the Development Version
 
